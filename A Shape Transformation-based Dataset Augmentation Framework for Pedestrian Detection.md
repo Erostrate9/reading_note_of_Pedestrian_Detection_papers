@@ -8,7 +8,7 @@
 
 * deep convolutional neural networks (DCNNs) 深度卷积神经网络在行人识别中表现良好，但DCNNs识别器在遇到负背景比正前景突出的情况时可能会不够鲁棒。用有限前景样本训练的DCNN识别器面对未学习过的复杂测试物体会非常脆弱。
   * positive foreground or positive space 是图像中我们期望观察的主体，如行人。
-  * negative background or negative space 是图像中主体以外的背景，如街道。
+  * negative background or negative space 是图像中主体以外的背景，如车辆、建筑物等。
 
 ### 现有的解决方案
 
@@ -115,7 +115,7 @@ $z^{gen}_{i\rarr j}=f_{STDA}(z_i,s_i,s_j,I)=f_{EA}(f_{SD}(z_i,s_i,s_j),I)$
 * 所采用的网络将行人块$z_i$，其形状$s_i$以及目标形状$s_j$和来自$I$的背景背景块作为输入，然后预测$V_{i\rarr j}$和$\alpha(x,y)$。
 * 作者在实践中发现U-Net有能力联合学习这两个子任务，联合学习和单独学习两个子任务效果是一样的，同时大大简化了处理框架，节省了计算资源和所需参数。因此作者选择同时向U-Net提供所有必要的输入信息来融合两个函数的学习。
 
-#### Shape-guided Deformation
+#### 3.2.1 Shape-guided Deformation
 
 作者用warping操作来实现变形，引入了形状引导变换场（*shape-guided warping field*）来描述该操作。用$v_{i\rarr j}(x,y)$表示位于$(x,y)$处的warping向量，变换场（warping field）就是这些向量的集合，i.e. $V_{i\rarr j}=\{v_{i\rarr j}(x,y)\}$。
 
@@ -133,3 +133,87 @@ $z^{gen}_{i\rarr j}=f_{STDA}(z_i,s_i,s_j,I)=f_{EA}(f_{SD}(z_i,s_i,s_j),I)$
 
 * $s_i与s_j$不能相差过大，否则会产生扭曲影响性能，作者引入了形状约束操作（*Shape Constraining Operation*），具体细节不展开讨论。
 
+#### 3.2.2 Environment Adaptation
+
+由于光照条件的不连续性和mask提取器有瑕疵的形状预测等因素影响，直接生成的行人粘贴到环境中往往产生明显的外观不匹配，即不自然。所以需要环境适应。
+
+* 作者引入了一个所谓的环境感知混合映射（environment-aware blending map）来解决该问题。
+* 修正程序可以描述为：$z^{gen}_{i\rarr j}=f_{EA}(z^w_{i\rarr j},I)=\{z^a_{i\rarr j}(x,y)\}$
+  * 其中$z^a_{i\rarr j}(x,y)$是定位在$(x,y)$的环境适应结果：
+  * $z^a_{i\rarr j}(x,y)=(s_j(x,y)\cdot(x,y))\cdot z^w_{i\rarr j}(x,y)+(1-s_j(x,y)\cdot(x,y))\cdot I(x,y)$
+  * 其中$(x,y)$是位于该处的环境感知混合映射的入口值，上述的重建过程表示每个输出像素$z^a_{i\rarr j}(x,y)$是来自变形得到的行人的像素$z^w_{i\rarr j}(x,y)$和原始图像$I(x,y)$的加权组合，组合权重通过$s_j(x,y)\cdot(x,y)$计算得到，其中$s_j$为1表示前景，为0则表示背景。
+* 在实践中很难定义期望的改进结果和期望的环境感知混合影射，因此无法访问适当的监督信息来训练网络。在无监督的情况下，作者应用对抗损失来促进所用的网络学习并有效混合变形行人和环境。与上一个子任务类似，作者使用网络直接预测环境感知混合映射，同时采用了限制，防止行人外观畸变。特别的，作者才用了移位和重新缩放*tanh*压缩函数来使$\alpha(x,y)$的值位于0.8到1.2之间.
+
+### 3.3 Objectives 目标
+
+作者采用了U-Net架构的单个网络来预测两个子任务（形状引导的变换场和环境感知混合映射），因此可以统一训练目标。引入了两个损失，形状变换损失：$\mathcal{L}_{shape}=\mathbb{E}[||s_j-s^w_{i\rarr j}||_1]$
+
+循环重构损失：$\mathcal{L}_{cyc}=\mathbb{E}[||s_i-s^w_{j\rarr i}||_1+||z_i-z^w_{j\rarr i}||_1]$
+
+其中循环重构损失中描述了转换后的形状/图像逆运算得到的原图像与真实原图像的差距。
+
+此外，为了确保引导的变形和环境适应可以帮助产生更逼真的行人，与典型GAN类似，为采用的网络引入了鉴别器D来计算对抗性损失：
+
+$\mathcal{L}_{adv}=\mathbb{E}[\log D(z)]+\mathbb{E}[\log (1-D(z^{gen}_{i\rarr j}))]$
+
+* 其中z指数据集中任何真是行人。
+
+由于最终目标是提高检测性能，因此进一步应用难分正样本挖掘损失来放大变形行人对提高检测鲁棒性的益处，作者试图生成不易被RCNN检测器识别的行人，特别的是，作者仅引入损失函数以帮助所用网络学习为RCNN检测器生成难分正样本。为了计算这种损失，作者训练了一个RCNN表示为R，以区分行人和背景，难分正样本挖掘损失定义为：
+
+$\mathcal{L}_{hpm}=\mathbb{E}[\log (1-R(z^{gen}_{i\rarr j}))]+\mathbb{E}[\log R(z)]+\mathbb{E}[\log (1-R(b))]$
+
+其中b指数据集中背景图像快.
+
+然后得到了总体损失：$$\mathcal{L}=\omega_1\mathcal{L}_{shape}+\omega_2\mathcal{L}_{cyc}+\omega_3\mathcal{L}_{adv}+\omega_4\mathcal{L}_{hpm}$$
+
+$\omega$是相应的损失权重.
+
+### 3.4 Dataset Augmentation
+
+扩充数据集时，作者尝试采样更自然的位置和大小以防止转换后的行人，非常幸运的是行人数据集提供了足够的信息，如行人的长宽比、描述行人边界框的线性模型等。作者根据该线性模型对多个位置和大小进行采样。
+
+为了避免对具有不适当背景的块进行采样，作者倾向于限制采样的框与真实行人尽量近。例如，作者倾向于对真实行人周围的位置进行采样（在100个像素内），并且作者将采样块的高度与其最近的真实行人的高度之间的差异限制在20个像素内；也就是说作者尽量把变形后的行人放在原数据集中真实行人附近的位置。
+
+算法1描述了应用所提出的框架来扩充行人数据集的详细流程。
+
+算法2详细描述了如何对图像中的位置和大小进行采样，这可以通过在真实行人周围进行采样来降低引入不适当背景的风险。
+
+
+
+## 4. Experiments
+
+作者使用流行的Caltech和CityPersons作为评价基准。以在不同的假阳性率下的对数平均漏检率（log-average miss rates, MR）作为表示行人检测性能的主要指标。在Caltech使用约42k个图像用于训练，4024个图像用于测试，使用RCNN提取形状；在CityPersons中使用2975张用于训练，并对来自验证集的500张图片进行测试，使用带注释的行人mask。为了增强数据集，作者用框架对每个图像增加了1~5个行人。
+
+作者使用了8个blocks的U-Net体系结构，所有的输入和输出块都是256*256。
+
+架构如图6所示![](https://raw.githubusercontent.com/Erostrate9/img/main/20211214211950.png)
+
+公式9中的D和公式10中的R都是有3个卷积块的CNNs。
+
+采用基于ResNet50的FPN检测器作为基线检测器。
+
+### 4.2 数据集增强结果
+
+#### 产生的行人
+
+图7展示了，分别在Caltech（顶部2行）和CityPersons（底部3行）的图像上用STDA进行数据集增强的结果。浅绿色边界框表示合成的行人。
+
+图7：![](https://raw.githubusercontent.com/Erostrate9/img/main/20211214212653.png)
+
+#### 4.2.2 对行人检测的提升
+
+图a是PS-GAN生成的行人图像，图b是STDA所生成的，可以明显看到STDA生成了人类肉眼可辩识的真实行人图像。
+
+![](https://raw.githubusercontent.com/Erostrate9/img/main/20211214212948.png)
+
+![](https://raw.githubusercontent.com/Erostrate9/img/main/20211214213018.png)
+
+图9和图10表明不论是与其他尖端行人检测器相比还是与其他行人合成方法相比，使用了STDA的检测器性能都更佳。
+
+![](https://raw.githubusercontent.com/Erostrate9/img/main/20211214213323.png)
+
+![](https://raw.githubusercontent.com/Erostrate9/img/main/20211214213403.png)
+
+表4展示了在CityPersons数据集上STDA的出色表现。
+
+![](https://raw.githubusercontent.com/Erostrate9/img/main/20211214214022.png)
